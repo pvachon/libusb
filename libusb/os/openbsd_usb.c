@@ -537,32 +537,32 @@ _handle_ep_event(struct libusb_context *ctx, struct libusb_device_handle *hdl, i
 	struct usbi_transfer *itransfer;
 	struct libusb_transfer *transfer;
 
-    usbi_dbg("");
+	usbi_dbg("");
 
 	if (0 > ioctl(ep, USB_ASYNC_FINISH, &aop_ret)) {
-        if (errno != EAGAIN) {
-            ret = _errno_to_libusb(errno);
-        } else {
-            *no_more = 1;
-            goto done;
-        }
-        goto done;
+		if (errno != EAGAIN) {
+			ret = _errno_to_libusb(errno);
+		} else {
+			*no_more = 1;
+			goto done;
+		}
+		goto done;
 	}
 
 	itransfer = aop_ret.uao_priv;
 	transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 
 	usbi_dbg("urb type=%d status=%d transferred=%d", transfer->type, aop_ret.uao_status,
-		aop_ret.uao_transfer_size);
+			aop_ret.uao_transfer_size);
 
-    itransfer->transferred = aop_ret.uao_transfer_size;
+	itransfer->transferred = aop_ret.uao_transfer_size;
 
-    if (aop_ret.uao_status) {
-        transfer->flags |= USBI_TRANSFER_TIMED_OUT;
-        ret = usbi_handle_transfer_cancellation(itransfer);
-    } else {
-        ret = usbi_handle_transfer_completion(itransfer, LIBUSB_TRANSFER_COMPLETED);
-    }
+	if (aop_ret.uao_status) {
+		transfer->flags |= USBI_TRANSFER_TIMED_OUT;
+		ret = usbi_handle_transfer_cancellation(itransfer);
+	} else {
+		ret = usbi_handle_transfer_completion(itransfer, LIBUSB_TRANSFER_COMPLETED);
+	}
 done:
 	return ret;
 }
@@ -571,17 +571,17 @@ int
 obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYPE nfds, int num_ready)
 {
 	struct handle_priv *hpriv;
-    struct device_priv *dpriv;
+	struct device_priv *dpriv;
 	int i;
 	int ret = 0;
 
-    usbi_dbg("");
+	usbi_dbg("");
 
 	for (i = 0; i < nfds && num_ready > 0; i++) {
 		struct libusb_device_handle *handle;
 		struct pollfd *pfd = &fds[i];
 		int ep = -1, j;
-        char no_more = 0;
+		char no_more = 0;
 
 		if (0 == pfd->revents) {
 			continue;
@@ -590,16 +590,16 @@ obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYP
 		num_ready--;
 		list_for_each_entry(handle, &ctx->open_devs, list, struct libusb_device_handle) {
 			hpriv = (struct handle_priv *)handle->os_priv;
-            dpriv = (struct device_priv *)handle->dev->os_priv;
+			dpriv = (struct device_priv *)handle->dev->os_priv;
 
-            if (pfd->fd == dpriv->fd) {
-                ep = dpriv->fd;
-                break;
-            }
+			if (pfd->fd == dpriv->fd) {
+				ep = dpriv->fd;
+				break;
+			}
 
 			for (j = 0; j < USB_MAX_ENDPOINTS; j++) {
-				if (hpriv->endpoints[USB_MAX_ENDPOINTS] == pfd->fd) {
-					ep = j;
+				if (hpriv->endpoints[j] == pfd->fd) {
+					ep = hpriv->endpoints[j];
 					break;
 				}
 			}
@@ -612,6 +612,7 @@ obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYP
 
 		/* Couldn't find this file descriptor */
 		if (ep == -1) {
+			usbi_info(ctx, "could not find fd %d", pfd->fd);
 			continue;
 		}
 
@@ -619,9 +620,9 @@ obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYP
 			ret = _handle_ep_event(ctx, handle, ep, &no_more);
 		} while (0 == no_more && 0 == ret);
 
-        if (ret != 0) {
-            break;
-        }
+		if (ret != 0) {
+			break;
+		}
 	}
 
 	return ret;
