@@ -83,7 +83,7 @@ static int obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, PO
  */
 static int _errno_to_libusb(int);
 static int _cache_active_config_descriptor(struct libusb_device *);
-static int _sync_control_transfer(struct usbi_transfer *);
+static int _async_control_transfer(struct usbi_transfer *);
 static int _async_gen_transfer(struct usbi_transfer *);
 static int _access_endpoint(struct libusb_transfer *);
 
@@ -128,8 +128,8 @@ const struct usbi_os_backend openbsd_backend = {
 	obsd_cancel_transfer,
 	obsd_clear_transfer_priv,
 
-	obsd_handle_events,		/* handle_events() */
-	NULL,
+	obsd_handle_events,
+	NULL,                   /* handle_transfer_completion() */
 
 	obsd_clock_gettime,
 	sizeof(struct device_priv),
@@ -245,6 +245,7 @@ int
 obsd_open(struct libusb_device_handle *handle)
 {
 	struct device_priv *dpriv = (struct device_priv *)handle->dev->os_priv;
+    int ret;
 	char devnode[16];
 
 	if (dpriv->devname) {
@@ -257,6 +258,12 @@ obsd_open(struct libusb_device_handle *handle)
 		dpriv->fd = open(devnode, O_RDWR);
 		if (dpriv->fd < 0)
 			return _errno_to_libusb(errno);
+
+		if (0 > (ret = usbi_add_pollfd(HANDLE_CTX(handle), dpriv->fd, POLLIN))) {
+            close(dpriv->fd);
+            dpriv->fd = -1;
+            return ret;
+        }
 
 		usbi_dbg("open %s: fd %d", devnode, dpriv->fd);
 	}
@@ -271,6 +278,7 @@ obsd_close(struct libusb_device_handle *handle)
 
 	if (dpriv->devname) {
 		usbi_dbg("close: fd %d", dpriv->fd);
+        usbi_remove_pollfd(HANDLE_CTX(handle), dpriv->fd);
 		close(dpriv->fd);
 		dpriv->fd = -1;
 	}
@@ -479,7 +487,7 @@ obsd_submit_transfer(struct usbi_transfer *itransfer)
 
 	switch (transfer->type) {
 	case LIBUSB_TRANSFER_TYPE_CONTROL:
-		err = _sync_control_transfer(itransfer);
+		err = _async_control_transfer(itransfer);
 		break;
 	case LIBUSB_TRANSFER_TYPE_ISOCHRONOUS:
 		/* Isochronous operations are currently not supported */
@@ -502,8 +510,6 @@ obsd_submit_transfer(struct usbi_transfer *itransfer)
 	if (err)
 		return (err);
 
-	usbi_signal_transfer_completion(itransfer);
-
 	return (LIBUSB_SUCCESS);
 }
 
@@ -524,15 +530,23 @@ obsd_clear_transfer_priv(struct usbi_transfer *itransfer)
 }
 
 static int
-_handle_ep_event(struct libusb_context *ctx, struct libusb_device_handle *hdl, int ep)
+_handle_ep_event(struct libusb_context *ctx, struct libusb_device_handle *hdl, int ep, char *no_more)
 {
 	int ret = 0;
 	struct usb_async_op aop_ret;
 	struct usbi_transfer *itransfer;
 	struct libusb_transfer *transfer;
 
-	if ((ret = ioctl(ep, USB_ASYNC_FINISH, &aop_ret))) {
-		goto done;
+    usbi_dbg("");
+
+	if (0 > ioctl(ep, USB_ASYNC_FINISH, &aop_ret)) {
+        if (errno != EAGAIN) {
+            ret = _errno_to_libusb(errno);
+        } else {
+            *no_more = 1;
+            goto done;
+        }
+        goto done;
 	}
 
 	itransfer = aop_ret.uao_priv;
@@ -541,7 +555,14 @@ _handle_ep_event(struct libusb_context *ctx, struct libusb_device_handle *hdl, i
 	usbi_dbg("urb type=%d status=%d transferred=%d", transfer->type, aop_ret.uao_status,
 		aop_ret.uao_transfer_size);
 
-	ret = usbi_handle_transfer_completion(itransfer, LIBUSB_TRANSFER_COMPLETED);
+    itransfer->transferred = aop_ret.uao_transfer_size;
+
+    if (aop_ret.uao_status) {
+        transfer->flags |= USBI_TRANSFER_TIMED_OUT;
+        ret = usbi_handle_transfer_cancellation(itransfer);
+    } else {
+        ret = usbi_handle_transfer_completion(itransfer, LIBUSB_TRANSFER_COMPLETED);
+    }
 done:
 	return ret;
 }
@@ -550,13 +571,17 @@ int
 obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYPE nfds, int num_ready)
 {
 	struct handle_priv *hpriv;
+    struct device_priv *dpriv;
 	int i;
 	int ret = 0;
+
+    usbi_dbg("");
 
 	for (i = 0; i < nfds && num_ready > 0; i++) {
 		struct libusb_device_handle *handle;
 		struct pollfd *pfd = &fds[i];
 		int ep = -1, j;
+        char no_more = 0;
 
 		if (0 == pfd->revents) {
 			continue;
@@ -565,6 +590,13 @@ obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYP
 		num_ready--;
 		list_for_each_entry(handle, &ctx->open_devs, list, struct libusb_device_handle) {
 			hpriv = (struct handle_priv *)handle->os_priv;
+            dpriv = (struct device_priv *)handle->dev->os_priv;
+
+            if (pfd->fd == dpriv->fd) {
+                ep = dpriv->fd;
+                break;
+            }
+
 			for (j = 0; j < USB_MAX_ENDPOINTS; j++) {
 				if (hpriv->endpoints[USB_MAX_ENDPOINTS] == pfd->fd) {
 					ep = j;
@@ -584,20 +616,16 @@ obsd_handle_events(struct libusb_context *ctx, struct pollfd *fds, POLL_NFDS_TYP
 		}
 
 		do {
-			ret = _handle_ep_event(ctx, handle, ep);
-		} while (ret == 0);
+			ret = _handle_ep_event(ctx, handle, ep, &no_more);
+		} while (0 == no_more && 0 == ret);
+
+        if (ret != 0) {
+            break;
+        }
 	}
 
 	return ret;
 }
-
-#if 0
-int
-obsd_handle_transfer_completion(struct usbi_transfer *itransfer)
-{
-	return usbi_handle_transfer_completion(itransfer, LIBUSB_TRANSFER_COMPLETED);
-}
-#endif
 
 int
 obsd_clock_gettime(int clkid, struct timespec *tp)
@@ -690,16 +718,17 @@ _cache_active_config_descriptor(struct libusb_device *dev)
 }
 
 int
-_sync_control_transfer(struct usbi_transfer *itransfer)
+_async_control_transfer(struct usbi_transfer *itransfer)
 {
 	struct libusb_transfer *transfer;
 	struct libusb_control_setup *setup;
 	struct device_priv *dpriv;
-	struct usb_ctl_request req;
+    struct usb_async_op *aop;
 
 	transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 	dpriv = (struct device_priv *)transfer->dev_handle->dev->os_priv;
 	setup = (struct libusb_control_setup *)transfer->buffer;
+    aop = usbi_transfer_get_os_priv(itransfer);
 
 	usbi_dbg("type %x request %x value %x index %d length %d timeout %d",
 	    setup->bmRequestType, setup->bRequest,
@@ -707,48 +736,24 @@ _sync_control_transfer(struct usbi_transfer *itransfer)
 	    libusb_le16_to_cpu(setup->wIndex),
 	    libusb_le16_to_cpu(setup->wLength), transfer->timeout);
 
-	req.ucr_addr = transfer->dev_handle->dev->device_address;
-	req.ucr_request.bmRequestType = setup->bmRequestType;
-	req.ucr_request.bRequest = setup->bRequest;
-	/* Don't use USETW, libusb already deals with the endianness */
-	(*(uint16_t *)req.ucr_request.wValue) = setup->wValue;
-	(*(uint16_t *)req.ucr_request.wIndex) = setup->wIndex;
-	(*(uint16_t *)req.ucr_request.wLength) = setup->wLength;
-	req.ucr_data = transfer->buffer + LIBUSB_CONTROL_SETUP_SIZE;
-
-	if ((transfer->flags & LIBUSB_TRANSFER_SHORT_NOT_OK) == 0)
-		req.ucr_flags = USBD_SHORT_XFER_OK;
+    aop->uao_ep = 0;
+    aop->uao_buf = transfer->buffer;
+    aop->uao_buf_len = transfer->length;
+    aop->uao_transfer_size = 0;
+    aop->uao_status = -1;
+	aop->uao_flags = ((transfer->flags & LIBUSB_TRANSFER_SHORT_NOT_OK) == 0) ? USB_OP_FLAG_ALLOW_SHORT : 0;
+    aop->uao_priv = itransfer;
+    aop->uao_timeout_ms = transfer->timeout;
+    aop->uao_type = USB_OP_CONTROL_TRANSFER;
 
 	if (dpriv->devname == NULL) {
-		/*
-		 * XXX If the device is not attached to ugen(4) it is
-		 * XXX still possible to submit a control transfer but
-		 * XXX with the default timeout only.
-		 */
-		int fd, err;
-
-		if ((fd = _bus_open(transfer->dev_handle->dev->bus_number)) < 0)
-			return _errno_to_libusb(errno);
-
-		if ((ioctl(fd, USB_REQUEST, &req)) < 0) {
-			err = errno;
-			close(fd);
-			return _errno_to_libusb(err);
-		}
-		close(fd);
+        return LIBUSB_ERROR_NO_DEVICE;
 	} else {
-		if ((ioctl(dpriv->fd, USB_SET_TIMEOUT, &transfer->timeout)) < 0)
-			return _errno_to_libusb(errno);
-
-		if ((ioctl(dpriv->fd, USB_DO_REQUEST, &req)) < 0)
+		if ((ioctl(dpriv->fd, USB_ASYNC_SUBMIT, aop)) < 0)
 			return _errno_to_libusb(errno);
 	}
 
-	itransfer->transferred = req.ucr_actlen;
-
-	usbi_dbg("transferred %d", itransfer->transferred);
-
-	return (0);
+	return 0;
 }
 
 int
@@ -817,8 +822,10 @@ _async_gen_transfer(struct usbi_transfer *itransfer)
 	aop->uao_transfer_size = 0;
 	aop->uao_status = 0;
 	aop->uao_flags = ((transfer->flags & LIBUSB_TRANSFER_SHORT_NOT_OK) == 0) ? USB_OP_FLAG_ALLOW_SHORT : 0;
-	aop->uao_priv = transfer;
+	aop->uao_priv = itransfer;
 	aop->uao_timeout_ms = transfer->timeout;
+    /* XXX fixme for Interrupt/Iso transfers */
+    aop->uao_type = USB_OP_BULK_TRANSFER;
 
 	/*
 	 * Bulk, Interrupt or Isochronous transfer depends on the
@@ -830,23 +837,6 @@ _async_gen_transfer(struct usbi_transfer *itransfer)
 	/* Submit the operation */
 	if ((ioctl(fd, USB_ASYNC_SUBMIT, aop)) < 0)
 		return _errno_to_libusb(errno);
-
-#if 0
-	if (IS_XFERIN(transfer)) {
-		if ((transfer->flags & LIBUSB_TRANSFER_SHORT_NOT_OK) == 0)
-			if ((ioctl(fd, USB_SET_SHORT_XFER, &nr)) < 0)
-				return _errno_to_libusb(errno);
-
-		nr = read(fd, transfer->buffer, transfer->length);
-	} else {
-		nr = write(fd, transfer->buffer, transfer->length);
-	}
-
-	if (nr < 0)
-		return _errno_to_libusb(errno);
-
-	itransfer->transferred = nr;
-#endif
 
 	return (0);
 }
