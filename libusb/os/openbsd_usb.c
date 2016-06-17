@@ -28,8 +28,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <dev/usb/usb.h>
 #include <sys/queue.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
 
 #include "libusbi.h"
 
@@ -532,7 +533,7 @@ obsd_clear_transfer_priv(struct usbi_transfer *itransfer)
 static int
 _handle_ep_event(struct libusb_context *ctx, struct libusb_device_handle *hdl, int ep, char *no_more)
 {
-	int ret = 0;
+	int ret = 0, status;
 	struct usb_async_op aop_ret;
 	struct usbi_transfer *itransfer;
 	struct libusb_transfer *transfer;
@@ -552,16 +553,38 @@ _handle_ep_event(struct libusb_context *ctx, struct libusb_device_handle *hdl, i
 	itransfer = aop_ret.uao_priv;
 	transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 
-	usbi_dbg("urb type=%d status=%d transferred=%d", transfer->type, aop_ret.uao_status,
+	usbi_dbg("urb type=%d status=%d transferred=%d", transfer->type,
+			aop_ret.uao_status,
 			aop_ret.uao_transfer_size);
 
 	itransfer->transferred = aop_ret.uao_transfer_size;
 
-	if (aop_ret.uao_status) {
-		transfer->flags |= USBI_TRANSFER_TIMED_OUT;
+	switch (aop_ret.uao_status) {
+	case USBD_NORMAL_COMPLETION:
+		itransfer->transferred = aop_ret.uao_transfer_size;
+		status = LIBUSB_TRANSFER_COMPLETED;
+		break;
+	case USBD_CANCELLED:
 		ret = usbi_handle_transfer_cancellation(itransfer);
-	} else {
-		ret = usbi_handle_transfer_completion(itransfer, LIBUSB_TRANSFER_COMPLETED);
+		status = LIBUSB_TRANSFER_CANCELLED;
+		break;
+	case USBD_STALLED:
+		status = LIBUSB_TRANSFER_STALL;
+		break;
+	case USBD_SHORT_XFER:
+		status = LIBUSB_TRANSFER_ERROR;
+		break;
+	case USBD_TIMEOUT:
+		status = LIBUSB_TRANSFER_TIMED_OUT;
+		transfer->flags |= USBI_TRANSFER_TIMED_OUT;
+		break;
+	default:
+		status = LIBUSB_TRANSFER_ERROR;
+		usbi_dbg("Unknown status: %d", aop_ret.uao_status);
+	}
+	if (status != LIBUSB_TRANSFER_CANCELLED) {
+		ret = usbi_handle_transfer_completion(itransfer,
+		    LIBUSB_TRANSFER_COMPLETED);
 	}
 done:
 	return ret;
@@ -803,6 +826,27 @@ done:
 }
 
 int
+_async_cancel_transfer(struct usbi_transfer *itransfer)
+{
+    int fd;
+
+	struct libusb_transfer *transfer;
+    struct usb_async_op *aop;
+
+	transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
+	aop = usbi_transfer_get_os_priv(itransfer);
+
+	if ((fd = _access_endpoint(transfer)) < 0)
+		return _errno_to_libusb(errno);
+
+	/* Submit the operation */
+	if ((ioctl(fd, USB_ASYNC_CANCEL, aop)) < 0)
+		return _errno_to_libusb(errno);
+
+    return 0;
+}
+
+int
 _async_gen_transfer(struct usbi_transfer *itransfer)
 {
 	struct libusb_transfer *transfer;
@@ -823,15 +867,13 @@ _async_gen_transfer(struct usbi_transfer *itransfer)
 	aop->uao_transfer_size = 0;
 	aop->uao_status = 0;
 	aop->uao_flags = ((transfer->flags & LIBUSB_TRANSFER_SHORT_NOT_OK) == 0) ? USB_OP_FLAG_ALLOW_SHORT : 0;
+	aop->uao_cookie = 0;
 	aop->uao_priv = itransfer;
 	aop->uao_timeout_ms = transfer->timeout;
-    /* XXX fixme for Interrupt/Iso transfers */
-    aop->uao_type = USB_OP_BULK_TRANSFER;
+	/* XXX fixme for Interrupt/Iso transfers */
+	aop->uao_type = USB_OP_BULK_TRANSFER;
 
-	/*
-	 * Bulk, Interrupt or Isochronous transfer depends on the
-	 * endpoint and thus the node to open.
-	 */
+    /* Open the endpoint */
 	if ((fd = _access_endpoint(transfer)) < 0)
 		return _errno_to_libusb(errno);
 
